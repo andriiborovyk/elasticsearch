@@ -22,13 +22,25 @@ package org.elasticsearch.repositories.s3;
 import com.amazonaws.ClientConfiguration;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.AWSCredentialsProviderChain;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.auth.AnonymousAWSCredentials;
 import com.amazonaws.auth.EC2ContainerCredentialsProviderWrapper;
+import com.amazonaws.auth.STSAssumeRoleWithWebIdentitySessionCredentialsProvider;
 import com.amazonaws.client.builder.AwsClientBuilder;
 import com.amazonaws.http.IdleConnectionReaper;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.internal.Constants;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClient;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.cluster.metadata.RepositoryMetaData;
 import org.elasticsearch.common.Strings;
@@ -39,7 +51,11 @@ import org.elasticsearch.common.settings.Settings;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Map;
+import org.elasticsearch.env.Environment;
 
+import static com.amazonaws.SDKGlobalConfiguration.AWS_ROLE_ARN_ENV_VAR;
+import static com.amazonaws.SDKGlobalConfiguration.AWS_ROLE_SESSION_NAME_ENV_VAR;
+import static com.amazonaws.SDKGlobalConfiguration.AWS_WEB_IDENTITY_ENV_VAR;
 import static java.util.Collections.emptyMap;
 
 class S3Service extends AbstractComponent implements Closeable {
@@ -57,6 +73,17 @@ class S3Service extends AbstractComponent implements Closeable {
      * in the {@link RepositoryMetaData}.
      */
     private volatile Map<S3ClientSettings, Map<RepositoryMetaData, S3ClientSettings>> derivedClientSettings = emptyMap();
+
+    final CustomWebIdentityTokenCredentialsProvider webIdentityTokenCredentialsProvider;
+
+    S3Service(Environment environment) {
+        webIdentityTokenCredentialsProvider = new CustomWebIdentityTokenCredentialsProvider(
+            environment,
+            System::getenv,
+            System::getProperty,
+            Clock.systemUTC()
+        );
+    }
 
     /**
      * Refreshes the settings for the AmazonS3 clients and clears the cache of
@@ -135,7 +162,7 @@ class S3Service extends AbstractComponent implements Closeable {
     // proxy for testing
     AmazonS3 buildClient(final S3ClientSettings clientSettings) {
         final AmazonS3ClientBuilder builder = AmazonS3ClientBuilder.standard();
-        builder.withCredentials(buildCredentials(logger, clientSettings));
+        builder.withCredentials(buildCredentials(logger, clientSettings, webIdentityTokenCredentialsProvider));
         builder.withClientConfiguration(buildConfiguration(clientSettings));
 
         final String endpoint = Strings.hasLength(clientSettings.endpoint) ? clientSettings.endpoint : Constants.S3_HOSTNAME;
@@ -177,17 +204,30 @@ class S3Service extends AbstractComponent implements Closeable {
         return clientConfiguration;
     }
 
-    // pkg private for tests
-    static AWSCredentialsProvider buildCredentials(Logger logger, S3ClientSettings clientSettings) {
+    static AWSCredentialsProvider buildCredentials(
+        Logger logger,
+        S3ClientSettings clientSettings,
+        CustomWebIdentityTokenCredentialsProvider webIdentityTokenCredentialsProvider
+    ) {
         final S3BasicCredentials credentials = clientSettings.credentials;
         if (credentials == null) {
-            logger.debug("Using instance profile credentials");
-            return new PrivilegedInstanceProfileCredentialsProvider();
+            if (webIdentityTokenCredentialsProvider.isActive()) {
+                logger.debug("Using a custom provider chain of Web Identity Token and instance profile credentials");
+                return new PrivilegedAWSCredentialsProvider(
+                    new AWSCredentialsProviderChain(
+                        new ErrorLoggingCredentialsProvider(webIdentityTokenCredentialsProvider, logger)
+                    )
+                );
+            } else {
+                logger.debug("Using instance profile credentials");
+                return new PrivilegedAWSCredentialsProvider(new EC2ContainerCredentialsProviderWrapper());
+            }
         } else {
             logger.debug("Using basic key/secret credentials");
             return new AWSStaticCredentialsProvider(credentials);
         }
     }
+
 
     private synchronized void releaseCachedClients() {
         // the clients will shutdown when they will not be used anymore
@@ -223,6 +263,164 @@ class S3Service extends AbstractComponent implements Closeable {
     @Override
     public void close() throws IOException {
         releaseCachedClients();
+    }
+
+    /**
+     * Customizes {@link com.amazonaws.auth.WebIdentityTokenCredentialsProvider}
+     *
+     * <ul>
+     * <li>Reads the the location of the web identity token not from AWS_WEB_IDENTITY_TOKEN_FILE, but from a symlink
+     * in the plugin directory, so we don't need to create a hardcoded read file permission for the plugin.</li>
+     * <li>Supports customization of the STS endpoint via a system property, so we can test it against a test fixture.</li>
+     * <li>Supports gracefully shutting down the provider and the STS client.</li>
+     * </ul>
+     */
+    static class CustomWebIdentityTokenCredentialsProvider implements AWSCredentialsProvider {
+
+        private static final String STS_HOSTNAME = "https://sts.amazonaws.com";
+
+        private STSAssumeRoleWithWebIdentitySessionCredentialsProvider credentialsProvider;
+        private AWSSecurityTokenService stsClient;
+
+        CustomWebIdentityTokenCredentialsProvider(
+            Environment environment,
+            SystemEnvironment systemEnvironment,
+            JvmEnvironment jvmEnvironment,
+            Clock clock
+        ) {
+            // Check whether the original environment variable exists. If it doesn't,
+            // the system doesn't support AWS web identity tokens
+            if (systemEnvironment.getEnv(AWS_WEB_IDENTITY_ENV_VAR) == null) {
+                return;
+            }
+            // Make sure that a readable symlink to the token file exists in the plugin config directory
+            // AWS_WEB_IDENTITY_TOKEN_FILE exists but we only use Web Identity Tokens if a corresponding symlink exists and is readable
+            Path webIdentityTokenFileSymlink = environment.configFile().resolve("repository-s3/aws-web-identity-token-file");
+            if (Files.exists(webIdentityTokenFileSymlink) == false) {
+                System.err.println(
+                    "Cannot use AWS Web Identity Tokens: AWS_WEB_IDENTITY_TOKEN_FILE is defined but no corresponding symlink exists "
+                        + "in the config directory"
+                );
+                return;
+            }
+            if (Files.isReadable(webIdentityTokenFileSymlink) == false) {
+                throw new IllegalStateException("Unable to read a Web Identity Token symlink in the config directory");
+            }
+            String roleArn = systemEnvironment.getEnv(AWS_ROLE_ARN_ENV_VAR);
+            if (roleArn == null) {
+                System.err.println(
+                    "Unable to use a web identity token for authentication. The AWS_WEB_IDENTITY_TOKEN_FILE environment "
+                        + "variable is set, but either AWS_ROLE_ARN is missing"
+                );
+                return;
+            }
+            String roleSessionName = Optional.ofNullable(systemEnvironment.getEnv(AWS_ROLE_SESSION_NAME_ENV_VAR)).orElseGet(() -> "aws-sdk-java-" + clock.millis());
+            AWSSecurityTokenServiceClientBuilder stsClientBuilder = AWSSecurityTokenServiceClient.builder();
+
+            // Custom system property used for specifying a mocked version of the STS for testing
+            String customStsEndpoint = jvmEnvironment.getProperty("com.amazonaws.sdk.stsMetadataServiceEndpointOverride", STS_HOSTNAME);
+            // Set the region explicitly via the endpoint URL, so the AWS SDK doesn't make any guesses internally.
+            stsClientBuilder.withEndpointConfiguration(new AwsClientBuilder.EndpointConfiguration(customStsEndpoint, null));
+            stsClientBuilder.withCredentials(new AWSStaticCredentialsProvider(new AnonymousAWSCredentials()));
+            stsClient = SocketAccess.doPrivileged(stsClientBuilder::build);
+            try {
+                credentialsProvider = new STSAssumeRoleWithWebIdentitySessionCredentialsProvider.Builder(
+                    roleArn,
+                    roleSessionName,
+                    webIdentityTokenFileSymlink.toString()
+                ).withStsClient(stsClient).build();
+            } catch (Exception e) {
+                stsClient.shutdown();
+                throw e;
+            }
+        }
+
+        boolean isActive() {
+            return credentialsProvider != null;
+        }
+
+        @Override
+        public AWSCredentials getCredentials() {
+            Objects.requireNonNull(credentialsProvider, "credentialsProvider is not set");
+            return credentialsProvider.getCredentials();
+        }
+
+        @Override
+        public void refresh() {
+            if (credentialsProvider != null) {
+                credentialsProvider.refresh();
+            }
+        }
+
+        public void shutdown() throws IOException {
+            if (credentialsProvider != null) {
+                credentialsProvider.close();
+                stsClient.shutdown();
+            }
+        }
+    }
+
+
+    static class PrivilegedAWSCredentialsProvider implements AWSCredentialsProvider {
+        private final AWSCredentialsProvider credentialsProvider;
+
+        private PrivilegedAWSCredentialsProvider(AWSCredentialsProvider credentialsProvider) {
+            this.credentialsProvider = credentialsProvider;
+        }
+
+        AWSCredentialsProvider getCredentialsProvider() {
+            return credentialsProvider;
+        }
+
+        @Override
+        public AWSCredentials getCredentials() {
+            return SocketAccess.doPrivileged(credentialsProvider::getCredentials);
+        }
+
+        @Override
+        public void refresh() {
+            SocketAccess.doPrivilegedVoid(credentialsProvider::refresh);
+        }
+    }
+
+    static class ErrorLoggingCredentialsProvider implements AWSCredentialsProvider {
+
+        private final AWSCredentialsProvider delegate;
+        private final Logger logger;
+
+        ErrorLoggingCredentialsProvider(AWSCredentialsProvider delegate, Logger logger) {
+            this.delegate = Objects.requireNonNull(delegate);
+            this.logger = Objects.requireNonNull(logger);
+        }
+
+        @Override
+        public AWSCredentials getCredentials() {
+            try {
+                return delegate.getCredentials();
+            } catch (Exception e) {
+                logger.error(() -> "Unable to load credentials from " + delegate, e);
+                throw e;
+            }
+        }
+
+        @Override
+        public void refresh() {
+            try {
+                delegate.refresh();
+            } catch (Exception e) {
+                logger.error(() -> "Unable to refresh " + delegate, e);
+                throw e;
+            }
+        }
+    }
+    @FunctionalInterface
+    interface SystemEnvironment {
+        String getEnv(String name);
+    }
+
+    @FunctionalInterface
+    interface JvmEnvironment {
+        String getProperty(String key, String defaultValue);
     }
 
 }

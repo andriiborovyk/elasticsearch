@@ -61,29 +61,34 @@ public class S3RepositoryPlugin extends Plugin implements RepositoryPlugin, Relo
         });
     }
 
-    protected final S3Service service;
+    protected S3Service service;
 
     public S3RepositoryPlugin(final Settings settings) {
-        this(settings, new S3Service());
     }
 
     S3RepositoryPlugin(final Settings settings, final S3Service service) {
         this.service = Objects.requireNonNull(service, "S3 service must not be null");
-        // eagerly load client settings so that secure settings are read
-        final Map<String, S3ClientSettings> clientsSettings = S3ClientSettings.load(settings);
-        this.service.refreshAndClearCache(clientsSettings);
     }
 
     // proxy method for testing
     protected S3Repository createRepository(final RepositoryMetaData metadata,
-                                            final Settings settings,
+                                            final Environment env,
                                             final NamedXContentRegistry registry) {
-        return new S3Repository(metadata, settings, registry, service);
+        return new S3Repository(metadata, env.settings(), registry, getService(env));
+    }
+
+    protected synchronized S3Service getService(final Environment env) {
+        if (service == null) {
+            service = new S3Service(env);
+            final Map<String, S3ClientSettings> clientsSettings = S3ClientSettings.load(env.settings());
+            this.service.refreshAndClearCache(clientsSettings);
+        }
+        return service;
     }
 
     @Override
     public Map<String, Repository.Factory> getRepositories(final Environment env, final NamedXContentRegistry registry) {
-        return Collections.singletonMap(S3Repository.TYPE, (metadata) -> createRepository(metadata, env.settings(), registry));
+        return Collections.singletonMap(S3Repository.TYPE, (metadata) -> createRepository(metadata, env, registry));
     }
 
     @Override

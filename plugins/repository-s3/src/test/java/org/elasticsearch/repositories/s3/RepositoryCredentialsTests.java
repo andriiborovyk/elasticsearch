@@ -22,11 +22,15 @@ package org.elasticsearch.repositories.s3;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.services.s3.AmazonS3;
+import java.io.File;
+import java.net.URI;
+import java.nio.file.Path;
 import org.elasticsearch.cluster.metadata.RepositoryMetaData;
 import org.elasticsearch.common.SuppressForbidden;
 import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+import org.elasticsearch.env.Environment;
 import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
@@ -59,21 +63,26 @@ public class RepositoryCredentialsTests extends ESTestCase {
         }
 
         static final class ProxyS3Service extends S3Service {
+
+            ProxyS3Service(Environment environment) {
+                super(environment);
+            }
+
             @Override
             AmazonS3 buildClient(final S3ClientSettings clientSettings) {
                 final AmazonS3 client = super.buildClient(clientSettings);
-                return new ClientAndCredentials(client, buildCredentials(logger, clientSettings));
+                return new ClientAndCredentials(client, buildCredentials(logger, clientSettings, null));
             }
 
         }
 
         ProxyS3RepositoryPlugin(Settings settings) {
-            super(settings, new ProxyS3Service());
+            super(settings, new ProxyS3Service(new Environment(settings, new File(".").toPath())));
         }
 
         @Override
-        protected S3Repository createRepository(RepositoryMetaData metadata, Settings settings, NamedXContentRegistry registry) {
-            return new S3Repository(metadata, settings, registry, service){
+        protected S3Repository createRepository(RepositoryMetaData metadata, Environment env, NamedXContentRegistry registry) {
+            return new S3Repository(metadata, env.settings(), registry, service){
                 @Override
                 protected void assertSnapshotOrGenericThread() {
                     // eliminate thread name check as we create repo manually on test/main threads
@@ -140,7 +149,7 @@ public class RepositoryCredentialsTests extends ESTestCase {
     }
 
     private S3Repository createAndStartRepository(RepositoryMetaData metadata, S3RepositoryPlugin s3Plugin) {
-        final S3Repository repository = s3Plugin.createRepository(metadata, Settings.EMPTY, NamedXContentRegistry.EMPTY);
+        final S3Repository repository = s3Plugin.createRepository(metadata, new Environment(Settings.EMPTY, new File(".").toPath()), NamedXContentRegistry.EMPTY);
         repository.start();
         return repository;
     }
